@@ -283,7 +283,7 @@ def match_course(raw: str, db_df: pd.DataFrame) -> tuple:
     stop = {"of","in","and","the","for","to","a","an"}
 
     for _, row in db_df.iterrows():
-        db_n = normalize(row["course_name"])
+        db_n = normalize(row.get("course_name", ""))
         if not db_n:
             continue
         if raw_n == db_n:
@@ -357,7 +357,12 @@ def run_db_pipeline(raw_df: pd.DataFrame, db_df: pd.DataFrame) -> tuple:
             admin   = admin * 2
 
         if db_match is not None:
-            dur = int(db_match["duration_years"])
+            # Support both duration and duration_years column names
+            dur_val = db_match.get("duration_years", db_match.get("duration", 1))
+            try:
+                dur = int(float(str(dur_val))) if dur_val and str(dur_val).strip() not in ("","nan") else 1
+            except Exception:
+                dur = 1
             for yr in range(1, dur + 1):
                 other = []
                 if admin > 0:
@@ -413,10 +418,9 @@ async def process(
     except Exception as e:
         raise HTTPException(400, f"Cannot read master sheet: {e}")
 
-    required = {"course_id","course_name","duration_years"}
-    missing  = required - set(db_df.columns)
-    if missing:
-        raise HTTPException(400, f"Master sheet missing columns: {missing}")
+    # Flexible — only course_id is truly required for output
+    if "course_id" not in db_df.columns:
+        raise HTTPException(400, "Master sheet must have a course_id column.")
 
     oai_client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -435,18 +439,55 @@ async def process(
     if matched_df.empty and unmatched_df.empty:
         raise HTTPException(422, "Pipeline produced no output.")
 
-    college_id = matched_df["college_id"].iloc[0] if not matched_df.empty else "output"
+    college_id = matched_df["college_id"].iloc[0] if not matched_df.empty else db_df["college_id"].iloc[0] if "college_id" in db_df.columns else "output"
     filename   = f"{college_id}_fees.xlsx"
+
+    # ── Merge fees back INTO master sheet template ────────────────────────────
+    # Start with master sheet as base (preserves course_id, course_name, duration etc)
+    output_df = db_df.copy()
+
+    fee_fill_cols = ["tuition_fee","other_fees","total_fee","application_fee",
+                     "options_for_fee_source","is_fees_tentative","is_discontinued",
+                     "year_added","quota","type","course_tag","course_tag_name"]
+
+    if not matched_df.empty:
+        # Build lookup: course_id -> first matched row fees
+        matched_clean = matched_df.drop(columns=["_match_type","_match_confidence"], errors="ignore")
+        fee_lookup = {}
+        for _, mrow in matched_clean.iterrows():
+            cid = mrow.get("course_id")
+            yr  = mrow.get("duration", 1)
+            key = (cid, yr)
+            if key not in fee_lookup:
+                fee_lookup[key] = mrow
+
+        # Fill fees into output rows by course_id + duration year
+        filled_rows = []
+        for _, orow in output_df.iterrows():
+            cid = orow.get("course_id")
+            yr  = orow.get("duration", 1)
+            key = (cid, yr)
+            new_row = orow.copy()
+            if key in fee_lookup:
+                src = fee_lookup[key]
+                for col in fee_fill_cols:
+                    if col in src and col in new_row.index:
+                        new_row[col] = src[col]
+            filled_rows.append(new_row)
+        output_df = pd.DataFrame(filled_rows)
+
+        # Low confidence review sheet
+        low = matched_df[matched_df["_match_confidence"] < 0.75]
+    else:
+        low = pd.DataFrame()
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if not matched_df.empty:
-            export = matched_df.drop(columns=["_match_type","_match_confidence"], errors="ignore")
-            export.to_excel(writer, index=False, sheet_name="FeeData")
-            low = matched_df[matched_df["_match_confidence"] < 0.75]
-            if not low.empty:
-                low.to_excel(writer, index=False, sheet_name="ReviewMatches")
+        output_df.to_excel(writer, index=False, sheet_name="FeeData")
+        if not low.empty:
+            low.to_excel(writer, index=False, sheet_name="ReviewMatches")
         if not unmatched_df.empty:
+            # Unmatched: output with blanks for course_id, filled fees
             unmatched_df.to_excel(writer, index=False, sheet_name="Unmatched")
 
     output.seek(0)
